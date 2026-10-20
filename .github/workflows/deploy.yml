@@ -1,0 +1,66 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+      mode:
+        description: What-if or deploy
+        type: choice
+        options: [what-if, deploy]
+        default: what-if
+  push:
+    branches: [main]
+    paths: ['infra/**']
+
+# No stored secrets: GitHub mints a short-lived OIDC token, Entra ID exchanges
+# it for an Azure credential scoped to this repo and branch.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.event.inputs.env || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy (${{ github.event.inputs.env || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.env || 'dev' }}
+    env:
+      ENV: ${{ github.event.inputs.env || 'dev' }}
+      MODE: ${{ github.event.inputs.mode || 'what-if' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate templates
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+
+      - name: What-if
+        if: env.MODE == 'what-if'
+        run: ./scripts/deploy.sh "$ENV" what-if
+
+      - name: Deploy
+        if: env.MODE == 'deploy'
+        run: ./scripts/deploy.sh "$ENV"
+
+      - name: Outputs
+        if: env.MODE == 'deploy'
+        run: |
+          az deployment sub show -n "$(az deployment sub list --query '[0].name' -o tsv)" \
+            --query properties.outputs -o json

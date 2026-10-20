@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-bicep:
+    name: Lint & build Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Bicep
+        run: |
+          curl -sLo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x bicep && sudo mv bicep /usr/local/bin/bicep
+          bicep --version
+      - name: Build all templates
+        run: |
+          bicep build infra/main.bicep --stdout > /dev/null
+          for f in infra/modules/*.bicep; do
+            echo "building $f"
+            bicep build "$f" --stdout > /dev/null
+          done
+      - name: Lint
+        run: bicep lint infra/main.bicep
+
+  lint-shell:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh || true
+
+  lint-powershell:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path scripts/runbooks -Severity Error
+          $issues | Format-Table -AutoSize
+          if ($issues) { exit 1 }
+
+  app-test:
+    name: App smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Extract app from cloud-init and test /health
+        run: |
+          python - <<'EOF'
+          import re, pathlib
+          y = pathlib.Path('app/cloud-init.yaml').read_text()
+          m = re.search(r'- path: /opt/app/server.py\n.*?content: \|\n(.*?)\n\n  - path:', y, re.S)
+          src = '\n'.join(line[6:] for line in m.group(1).splitlines())
+          pathlib.Path('/tmp/server.py').write_text(src)
+          EOF
+          cd /tmp && (python server.py &) && sleep 2
+          code=$(curl -s -o /tmp/body -w '%{http_code}' http://127.0.0.1:8080/health)
+          echo "status=$code body=$(cat /tmp/body)"
+          test "$code" = "200"
+          test "$(cat /tmp/body)" = "ok"
